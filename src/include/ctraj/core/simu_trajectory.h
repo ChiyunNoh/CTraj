@@ -53,17 +53,20 @@ protected:
     TrajPtr _trajectory;
     double _hz;
     Eigen::aligned_vector<Posed> _poseSeq;
+    double _stationaryTime;
 
 protected:
-    explicit SimuTrajectory(double sTime, double eTime, double hz)
+    explicit SimuTrajectory(double sTime, double eTime, double hz, double stationaryTime = 0.0)
         : _trajectory(Traj::Create(2.0 / hz, sTime, eTime)),
           _hz(hz),
-          _poseSeq() {}
+          _poseSeq(),
+          _stationaryTime(stationaryTime) {}
 
     SimuTrajectory(const SimuTrajectory &other)
         : _trajectory(Traj::Create(0.0, 0.0, 0.0)),
           _hz(other._hz),
-          _poseSeq(other._poseSeq) {
+          _poseSeq(other._poseSeq),
+          _stationaryTime(other._stationaryTime) {
         *this->_trajectory = *other._trajectory;
     }
 
@@ -147,7 +150,12 @@ protected:
         double sTime = _trajectory->MinTime(), eTime = _trajectory->MaxTime(),
                deltaTime = 1.0 / _hz;
         for (double t = sTime; t < eTime;) {
-            _poseSeq.push_back(GenPoseSequenceAtTime(t));
+            double t2 = t;
+            if (t2 < _stationaryTime) {
+                t2 = _stationaryTime;
+            }
+            _poseSeq.push_back(GenPoseSequenceAtTime(t2));
+            _poseSeq.back().timeStamp = t;
             t += deltaTime;
         }
         EstimateTrajectory(_poseSeq, _trajectory);
@@ -199,8 +207,9 @@ public:
     explicit SimuCircularMotion(double radius = 2.0,
                                 double sTime = 0.0,
                                 double eTime = 2 * M_PI,
-                                double hz = 10.0)
-        : Parent(sTime, eTime, hz),
+                                double hz = 10.0,
+                                double stationaryTime = 2.0)
+        : Parent(sTime, eTime, hz, stationaryTime),
           _radius(radius) {
         this->SimulateTrajectory();
     }
@@ -238,8 +247,9 @@ public:
                               double heightEachCircle = 2.0,
                               double sTime = 0.0,
                               double eTime = 4 * M_PI,
-                              double hz = 10.0)
-        : Parent(sTime, eTime, hz),
+                              double hz = 10.0,
+                              double stationaryTime = 2.0)
+        : Parent(sTime, eTime, hz, stationaryTime),
           _radius(radius),
           _heightEachCircle(heightEachCircle) {
         this->SimulateTrajectory();
@@ -247,14 +257,63 @@ public:
 
 protected:
     Posed GenPoseSequenceAtTime(double t) override {
-        Eigen::Vector3d trans;
-        trans(0) = std::cos(t) * _radius;
-        trans(1) = std::sin(t) * _radius;
-        trans(2) = t / (2.0 * M_PI) * _heightEachCircle;
+        // Periodic acceleration and deceleration parameters
+        const double speedPeriod = 2.0;  // Acceleration/deceleration period (seconds), adjustable
+        const double baseSpeed = 1.0;    // Base speed
+        const double speedAmplitude = 0.5;  // Speed fluctuation amplitude (relative to base speed)
 
-        Eigen::Vector3d yAxis = -trans.normalized();
-        Eigen::Vector3d xAxis = Eigen::Vector3d(-trans(1), trans(0), 0.0).normalized();
-        Eigen::Vector3d zAxis = xAxis.cross(yAxis);
+        // Periodic speed modulation function: use sine function for periodic
+        // acceleration/deceleration speed = base speed + amplitude * sin(2πt/period) When sin is
+        // positive, accelerate; when negative, decelerate, forming periodic changes
+        double speedFactor = baseSpeed + speedAmplitude * std::sin(2 * M_PI * t / speedPeriod);
+        // Ensure speed is not negative
+        speedFactor = std::max(0.1, speedFactor);
+
+        // Calculate the modulated time variable s(t), which is the integral of speed over time
+        // This integral determines the actual progress of the trajectory, reflecting
+        // acceleration/deceleration
+        double s = baseSpeed * t + (speedAmplitude * speedPeriod / (2 * M_PI)) *
+                                       (1 - std::cos(2 * M_PI * t / speedPeriod));
+
+        // Position calculation (use modulated time s instead of original time t)
+        Eigen::Vector3d trans;
+        trans(0) = std::cos(s) * _radius;  // x direction: circular motion
+        trans(1) = std::sin(s) * _radius;  // y direction: circular motion
+        trans(2) =
+            s / (2.0 * M_PI) * _heightEachCircle + std::sin(2 * M_PI * s) * _heightEachCircle / 10;
+
+        // Attitude calculation (add periodic rotational disturbance)
+        Eigen::Vector3d originalYAxis =
+            -trans.normalized();  // Original y-axis pointing to the origin
+        Eigen::Vector3d xAxis =
+            Eigen::Vector3d(-trans(1), trans(0), 0.0).normalized();  // Tangent direction x-axis
+
+        // 1. Define periodic disturbance parameters (adjustable as needed)
+        const double freq1 = 2.0;  // First rotation frequency (period 1/freq1)
+        const double freq2 =
+            3.0;  // Second rotation frequency (forms figure-8 or complex trajectories)
+        const double amp1 = 0.6;  // First rotation amplitude (radians, controls swing range)
+        const double amp2 = 0.4;  // Second rotation amplitude (radians)
+
+        // 2. Calculate time-varying rotation angles (periodic)
+        double theta1 = amp1 * std::sin(2 * M_PI * freq1 * s);  // Rotation angle around x-axis
+        double theta2 = amp2 * std::cos(2 * M_PI * freq2 * s);  // Rotation angle around z-axis
+
+        // 3. Construct composite rotation matrix (rotate around x-axis first, then z-axis)
+        Eigen::AngleAxisd rotX(theta1, xAxis);                     // Rotation around x-axis
+        Eigen::AngleAxisd rotZ(theta2, Eigen::Vector3d::UnitZ());  // Rotation around z-axis
+        Eigen::Quaterniond perturbRot = rotZ * rotX;               // Composite rotation
+
+        // 4. Apply rotational disturbance to the original y-axis to get the new y-axis direction
+        Eigen::Vector3d yAxis = perturbRot * originalYAxis;
+
+        // 5. Recalculate z-axis (ensure orthogonality)
+        Eigen::Vector3d zAxis = xAxis.cross(yAxis).normalized();
+
+        // 6. Ensure all axes are orthogonal and normalized (for numerical stability)
+        yAxis = zAxis.cross(xAxis).normalized();
+
+        // Construct rotation matrix
         Eigen::Matrix3d rotMatrix;
         rotMatrix.col(0) = xAxis;
         rotMatrix.col(1) = yAxis;
@@ -278,10 +337,11 @@ public:
                             double height = 0.5,
                             double sTime = 0.0,
                             double eTime = 2 * M_PI,
-                            double hz = 10.0)
+                            double hz = 10.0,
+                            double stationaryTime = 2.0)
         : _radius(radius),
           _height(height),
-          Parent(sTime, eTime, hz) {
+          Parent(sTime, eTime, hz, stationaryTime) {
         this->SimulateTrajectory();
     }
 
@@ -318,8 +378,9 @@ public:
                              double height = 0.5,
                              double sTime = 0.0,
                              double eTime = 2 * M_PI,
-                             double hz = 10.0)
-        : Parent(sTime, eTime, hz),
+                             double hz = 10.0,
+                             double stationaryTime = 2.0)
+        : Parent(sTime, eTime, hz, stationaryTime),
           _radius(radius),
           _height(height) {
         this->SimulateTrajectory();
@@ -361,8 +422,9 @@ public:
                                   double height = 0.5,
                                   double sTime = 0.0,
                                   double eTime = 10.0,
-                                  double hz = 10.0)
-        : Parent(sTime, eTime, hz),
+                                  double hz = 10.0,
+                                  double stationaryTime = 2.0)
+        : Parent(sTime, eTime, hz, stationaryTime),
           _xWidth(xWidth),
           _yWidth(yWidth),
           _height(height) {
@@ -402,8 +464,9 @@ public:
                                      const Eigen::Vector3d &to,
                                      double sTime = 0.0,
                                      double eTime = 10.0,
-                                     double hz = 10.0)
-        : Parent(sTime, eTime, hz),
+                                     double hz = 10.0,
+                                     double stationaryTime = 2.0)
+        : Parent(sTime, eTime, hz, stationaryTime),
           _from(from),
           _to(to) {
         this->SimulateTrajectory();
@@ -441,8 +504,9 @@ public:
                                           const Eigen::Vector3d &to,
                                           double sTime = 0.0,
                                           double eTime = 10.0,
-                                          double hz = 10.0)
-        : Parent(sTime, eTime, hz),
+                                          double hz = 10.0,
+                                          double stationaryTime = 2.0)
+        : Parent(sTime, eTime, hz, stationaryTime),
           _from(from),
           _to(to) {
         this->SimulateTrajectory();
@@ -483,8 +547,9 @@ public:
                                 double maxAngleDeg = 60.0,
                                 double sTime = 0.0,
                                 double eTime = 10.0,
-                                double hz = 10.0)
-        : Parent(sTime, eTime, hz),
+                                double hz = 10.0,
+                                double stationaryTime = 2.0)
+        : Parent(sTime, eTime, hz, stationaryTime),
           _lastState(Sophus::SO3d(), origin, sTime),
           _randStride(-maxStride, maxStride),
           _randAngle(-maxAngleDeg / 180.0 * M_PI, maxAngleDeg / 180.0 * M_PI),
