@@ -32,9 +32,13 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
+#define EIGEN_DONT_VECTORIZE
+#define EIGEN_DISABLE_UNALIGNED_ARRAY_ASSERT
+#include <Eigen/Dense>
 #include "ctraj/factor/marginalization_factor.h"
 #include "cereal/archives/json.hpp"
 #include "fstream"
+
 
 namespace ns_ctraj {
 
@@ -57,6 +61,7 @@ MarginalizationInfo::Ptr MarginalizationInfo::Create(
     const std::set<double *> &margParBlockAddVec,
     const std::vector<double *> &consideredParBlocks,
     int numThreads) {
+
     return std::make_shared<MarginalizationInfo>(prob, margParBlockAddVec, consideredParBlocks,
                                                  numThreads);
 }
@@ -93,6 +98,7 @@ void MarginalizationInfo::PreMarginalization(ceres::Problem *prob,
     std::vector<double *> totalParBlocksAdd;
     if (consideredParBlocks.empty()) {
         prob->GetParameterBlocks(&totalParBlocksAdd);
+
     } else {
         totalParBlocksAdd = consideredParBlocks;
         // remove parameter blocks that are not involved in this problem
@@ -123,11 +129,11 @@ void MarginalizationInfo::PreMarginalization(ceres::Problem *prob,
             keepParDime += localSize;
         }
     }
-
     // obtain JMat (jacobian matrix) and rVec (residuals vector)
     ceres::Problem::EvaluateOptions evalOpt;
     evalOpt.parameter_blocks.resize(totalParBlocksAdd.size());
     evalOpt.num_threads = numThreads;
+    
     for (int i = 0; i < static_cast<int>(totalParBlocksAdd.size()); ++i) {
         if (i < static_cast<int>(margParBlocks.size())) {
             evalOpt.parameter_blocks.at(i) = margParBlocks.at(i).address;
@@ -135,11 +141,15 @@ void MarginalizationInfo::PreMarginalization(ceres::Problem *prob,
             evalOpt.parameter_blocks.at(i) = keepParBlocks.at(i - margParBlocks.size()).address;
         }
     }
+    
 
     ceres::CRSMatrix jacobianCRSMatrix;
     std::vector<double> residuals;
+    
     prob->Evaluate(evalOpt, nullptr, &residuals, nullptr, &jacobianCRSMatrix);
+    
     JMat = CRSMatrix2EigenMatrix(&jacobianCRSMatrix);
+    
     rVec = Eigen::VectorXd(residuals.size());
     for (int i = 0; i < static_cast<int>(residuals.size()); ++i) {
         rVec(i) = residuals.at(i);
